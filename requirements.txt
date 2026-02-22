@@ -1,0 +1,14 @@
+pyspark
+fastapi
+uvicorn
+pydantic
+python-dotenv
+pydantic-settings
+crewai
+streamlit
+chromadb
+llama-index
+llama-index-embeddings-huggingface
+llama-index-llms-groq
+llama-index-vector-stores-chroma
+pymongo
