@@ -210,3 +210,4 @@ doc_verctor_store/
 *.sqlite3
 *.json
 *.bin
+dataset_ne/
