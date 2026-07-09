@@ -1,0 +1,13 @@
+[package]
+name = "tiny_llm_scratch_with_tokenizer"
+version = "0.1.0"
+edition = "2021"               # stable edition
+
+[lib]
+name = "tiny_llm_scratch_with_tokenizer"
+crate-type = ["cdylib"]
+
+[dependencies]
+unicode-normalization = "0.1"
+pyo3 = { version = "0.23", features = ["extension-module"] }
+# Add any other dependencies your NepBPE.rs uses
