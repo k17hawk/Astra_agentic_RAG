@@ -1,8 +1,8 @@
-# Astra_agentic_RAG# NepBPE — Benchmark & Correctness Report
+# NepBPE — Benchmark & Correctness Report
 
 Performance, correctness, and constraint-enforcement results for **NepBPE**, a custom Devanagari BPE tokenizer for Nepali.
 
-> **Hardware:** _Replace with your actual CPU/RAM, e.g. "Apple M1 Pro / 16 GB RAM" or "Intel Core i7-12700H / 32 GB RAM"_
+> **Hardware:** _32GB RAM core ryzen 7 8 core 6GB VRAM"_
 > **Toolchain:** Rust 1.70, compiled in release mode (`cargo build --release`)
 
 ---
@@ -81,9 +81,3 @@ Measured on the simplified vocabulary (626 → 685) with a 10,000-sentence corpu
 - **`decode()`** is type-based (not surface-based), so the byte-alphabet mapping can be changed without invalidating existing tokenised data.
 
 ---
-
-## Hardware Note
-
-Results above should be reproduced and reported with your own environment details, for example:
-
-> Run on Apple M1 Pro / 16 GB RAM, Rust 1.70, Python 3.11
