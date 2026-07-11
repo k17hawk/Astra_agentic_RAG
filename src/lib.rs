@@ -63,6 +63,7 @@ impl Script {
         match self {
             Script::DEV => 2,
             Script::PUN => 1,
+            Script::LAT => 1, 
             _ => 0,
         }
     }
@@ -230,15 +231,20 @@ pub enum Token {
 }
 
 impl Token {
-    /// Default script by variant. NOTE: for MergedToken this is only a
-    /// placeholder — Vocabulary::create_merged overrides id_to_script with the
-    /// left child's actual script, and Vocabulary::get_script is authoritative.
     pub fn script(&self) -> Script {
         match self {
             Token::Akshara(_) => Script::DEV,
             Token::Punctuation(_) => Script::PUN,
             Token::ZWNJ => Script::FMT,
-            Token::ByteFallback(_) => Script::MAL,
+            Token::ByteFallback(byte) => {
+                // Latin letters (a-z, A-Z) and digits (0-9) are LAT
+                // Everything else (spaces, punctuation, control codes, high bytes) stays MAL
+                if byte.is_ascii_alphanumeric() {
+                    Script::LAT
+                } else {
+                    Script::MAL
+                }
+            }
             Token::SeededMorpheme(_) => Script::DEV,
             Token::MergedToken(_) => Script::DEV,
         }
@@ -659,7 +665,7 @@ impl ConstrainedBPETrainer {
     fn script_compat(&self, a: TokenId, b: TokenId) -> bool {
         let sa = self.vocab.get_script(a);
         let sb = self.vocab.get_script(b);
-        sa == sb && (sa == Script::DEV || sa == Script::PUN)
+        sa == sb && matches!(sa, Script::DEV | Script::PUN | Script::LAT)
     }
 
     fn gate(&self, a: TokenId, b: TokenId, freq: Frequency) -> bool {
