@@ -26,6 +26,31 @@ type Frequency = u64;
 // tokens are recovered by *type* (Token::ByteFallback), not by surface.
 // ============================================================================
 
+/// Reverse the training driver's TSV escaping (\\ -> \, \t -> tab, \n -> nl).
+/// Single left-to-right pass so a real backslash isn't mis-paired with a
+/// following t/n.
+fn unescape_tsv(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn bytes_to_unicode() -> [char; 256] {
     let mut table = ['\u{0}'; 256];
     let mut n: u32 = 0;
@@ -63,7 +88,6 @@ impl Script {
         match self {
             Script::DEV => 2,
             Script::PUN => 1,
-            Script::LAT => 1, 
             _ => 0,
         }
     }
@@ -228,25 +252,25 @@ pub enum Token {
     ByteFallback(ByteVal),
     SeededMorpheme(String),
     MergedToken(Vec<TokenId>),
+    /// Reconstructed from a saved vocab (surface only, no merge/child history).
+    /// Enough for encode + decode; NOT enough to correctly resume training.
+    Loaded(String),
 }
 
 impl Token {
+    /// Default script by variant. NOTE: for MergedToken this is only a
+    /// placeholder — Vocabulary::create_merged overrides id_to_script with the
+    /// left child's actual script, and Vocabulary::get_script is authoritative.
+    /// For Loaded tokens the script is set directly during load, not from here.
     pub fn script(&self) -> Script {
         match self {
             Token::Akshara(_) => Script::DEV,
             Token::Punctuation(_) => Script::PUN,
             Token::ZWNJ => Script::FMT,
-            Token::ByteFallback(byte) => {
-                // Latin letters (a-z, A-Z) and digits (0-9) are LAT
-                // Everything else (spaces, punctuation, control codes, high bytes) stays MAL
-                if byte.is_ascii_alphanumeric() {
-                    Script::LAT
-                } else {
-                    Script::MAL
-                }
-            }
+            Token::ByteFallback(_) => Script::MAL,
             Token::SeededMorpheme(_) => Script::DEV,
             Token::MergedToken(_) => Script::DEV,
+            Token::Loaded(_) => Script::DEV,
         }
     }
 }
@@ -264,6 +288,8 @@ pub struct Vocabulary {
     v_ambiguous: HashSet<TokenId>,
     token_to_root_set: HashMap<TokenId, Vec<RootId>>,
     surfaces: HashMap<TokenId, String>,
+    /// Longest surface in CHARS — the cap for greedy longest-match encoding.
+    max_surface_len: usize,
 }
 
 impl Vocabulary {
@@ -324,6 +350,10 @@ impl Vocabulary {
 
         let id = self.tokens.len();
         let script = token.script();
+        let clen = surface.chars().count();
+        if clen > self.max_surface_len {
+            self.max_surface_len = clen;
+        }
         self.surface_to_id.insert(surface.clone(), id);
         self.id_to_script.insert(id, script);
         self.tokens.push(token);
@@ -366,6 +396,56 @@ impl Vocabulary {
 
     pub fn get_id_by_surface(&self, surface: &str) -> Option<TokenId> {
         self.surface_to_id.get(surface).copied()
+    }
+
+    pub fn max_surface_len(&self) -> usize {
+        self.max_surface_len
+    }
+
+    /// Rebuild the vocabulary from saved (id, surface) pairs — enough for
+    /// encode + decode. Byte tokens are recovered as ByteFallback via the byte
+    /// alphabet; everything else becomes a Loaded surface token. v_strict /
+    /// v_ambiguous / root sets are NOT restored, so a loaded vocab can tokenize
+    /// but should not be used to resume training.
+    ///
+    /// `pairs` must have contiguous ids 0..N; they are sorted defensively.
+    pub fn load_from_pairs(&mut self, mut pairs: Vec<(TokenId, String)>, byte_decoder: &HashMap<char, u8>) {
+        self.tokens.clear();
+        self.surface_to_id.clear();
+        self.id_to_script.clear();
+        self.v_strict.clear();
+        self.v_ambiguous.clear();
+        self.token_to_root_set.clear();
+        self.surfaces.clear();
+        self.max_surface_len = 0;
+
+        pairs.sort_by_key(|(id, _)| *id);
+
+        for (expected_id, surface) in pairs {
+            let id = self.tokens.len();
+            debug_assert_eq!(id, expected_id, "vocab ids must be contiguous from 0");
+
+            // A single char that lives in the byte alphabet is a byte token.
+            // (Merged surfaces are always >= 2 chars, so this never misfires on
+            // a real merge.)
+            let mut token = Arc::new(Token::Loaded(surface.clone()));
+            if surface.chars().count() == 1 {
+                let ch = surface.chars().next().unwrap();
+                if let Some(&b) = byte_decoder.get(&ch) {
+                    token = Arc::new(Token::ByteFallback(b));
+                }
+            }
+
+            let clen = surface.chars().count();
+            if clen > self.max_surface_len {
+                self.max_surface_len = clen;
+            }
+            let script = token.script();
+            self.surface_to_id.insert(surface.clone(), id);
+            self.id_to_script.insert(id, script);
+            self.surfaces.insert(id, surface);
+            self.tokens.push(token);
+        }
     }
 
     pub fn get_token(&self, id: TokenId) -> Option<&Arc<Token>> {
@@ -503,31 +583,45 @@ impl ParadigmRegistry {
 // Phase 3: Constrained BPE
 // ============================================================================
 
-/// Decrement a pair's count; prune the entry entirely when it reaches 0 so that
-/// pair_freqs.keys() never iterates dead entries.
-fn dec_pair(freqs: &mut HashMap<(TokenId, TokenId), Frequency>, key: (TokenId, TokenId)) {
+/// Decrement a pair's count by `by`; prune the entry entirely when it reaches 0
+/// so that pair_freqs.keys() never iterates dead entries.
+fn dec_pair(freqs: &mut HashMap<(TokenId, TokenId), Frequency>, key: (TokenId, TokenId), by: Frequency) {
     if let Some(f) = freqs.get_mut(&key) {
-        *f = f.saturating_sub(1);
+        *f = f.saturating_sub(by);
         if *f == 0 {
             freqs.remove(&key);
         }
     }
 }
 
-fn inc_pair(freqs: &mut HashMap<(TokenId, TokenId), Frequency>, key: (TokenId, TokenId)) {
-    *freqs.entry(key).or_insert(0) += 1;
+fn inc_pair(freqs: &mut HashMap<(TokenId, TokenId), Frequency>, key: (TokenId, TokenId), by: Frequency) {
+    *freqs.entry(key).or_insert(0) += by;
+}
+
+/// One deduplicated word TYPE: its initial token sequence and how many times it
+/// occurred in the corpus. This is the RAM + speed fix — the trainer iterates a
+/// few million unique word types, not billions of raw token positions, and pair
+/// frequencies are weighted by `count`.
+struct Word {
+    tokens: Vec<TokenId>,
+    count: Frequency,
 }
 
 pub struct Corpus {
-    words: Vec<Vec<TokenId>>,
+    words: Vec<Word>,
     pair_freqs: HashMap<(TokenId, TokenId), Frequency>,
     vocab_budget: usize,
 }
 
 impl Corpus {
-    pub fn new(sequences: Vec<Vec<TokenId>>, vocab_budget: usize) -> Self {
+    /// Build from a word-frequency dictionary (streaming path). Consumes `counts`.
+    pub fn from_word_counts(counts: HashMap<Vec<TokenId>, Frequency>, vocab_budget: usize) -> Self {
+        let words: Vec<Word> = counts
+            .into_iter()
+            .map(|(tokens, count)| Word { tokens, count })
+            .collect();
         let mut corpus = Self {
-            words: sequences,
+            words,
             pair_freqs: HashMap::new(),
             vocab_budget,
         };
@@ -535,14 +629,31 @@ impl Corpus {
         corpus
     }
 
-    /// Full scan — used ONCE at construction only.
+    /// Build from raw sequences with no dedup (each sequence has count 1).
+    /// Kept for the in-memory `train_bpe` / `train_from_text` path; do NOT use
+    /// this for very large corpora — use `from_word_counts` via `train_from_file`.
+    pub fn from_sequences(sequences: Vec<Vec<TokenId>>, vocab_budget: usize) -> Self {
+        let words: Vec<Word> = sequences
+            .into_iter()
+            .map(|tokens| Word { tokens, count: 1 })
+            .collect();
+        let mut corpus = Self {
+            words,
+            pair_freqs: HashMap::new(),
+            vocab_budget,
+        };
+        corpus.recompute_all_frequencies();
+        corpus
+    }
+
+    /// Full scan — used ONCE at construction only. Weighted by word count.
     fn recompute_all_frequencies(&mut self) {
         self.pair_freqs.clear();
-        for word in &self.words {
-            for window in word.windows(2) {
+        for w in &self.words {
+            for window in w.tokens.windows(2) {
                 *self.pair_freqs
                     .entry((window[0], window[1]))
-                    .or_insert(0) += 1;
+                    .or_insert(0) += w.count;
             }
         }
     }
@@ -567,40 +678,40 @@ impl Corpus {
     pub fn apply_merge(&mut self, a: TokenId, b: TokenId, new_id: TokenId) -> Vec<(TokenId, TokenId)> {
         let mut touched: HashSet<(TokenId, TokenId)> = HashSet::new();
 
-        for word in self.words.iter_mut() {
+        for w in self.words.iter_mut() {
+            let cnt = w.count;
             let mut i = 0;
-            while i + 1 < word.len() {
-                if word[i] == a && word[i + 1] == b {
-                    // Destroy old neighbour pairs.
+            while i + 1 < w.tokens.len() {
+                if w.tokens[i] == a && w.tokens[i + 1] == b {
+                    // Destroy old neighbour pairs (weighted by this word's count).
                     if i > 0 {
-                        let l = word[i - 1];
-                        dec_pair(&mut self.pair_freqs, (l, a));
+                        let l = w.tokens[i - 1];
+                        dec_pair(&mut self.pair_freqs, (l, a), cnt);
                         touched.insert((l, a));
                     }
-                    if i + 2 < word.len() {
-                        let r = word[i + 2];
-                        dec_pair(&mut self.pair_freqs, (b, r));
+                    if i + 2 < w.tokens.len() {
+                        let r = w.tokens[i + 2];
+                        dec_pair(&mut self.pair_freqs, (b, r), cnt);
                         touched.insert((b, r));
                     }
 
                     // Consume (a, b) -> new_id.
-                    word[i] = new_id;
-                    word.remove(i + 1);
+                    w.tokens[i] = new_id;
+                    w.tokens.remove(i + 1);
 
                     // Form new neighbour pairs.
                     if i > 0 {
-                        let l = word[i - 1];
-                        inc_pair(&mut self.pair_freqs, (l, new_id));
+                        let l = w.tokens[i - 1];
+                        inc_pair(&mut self.pair_freqs, (l, new_id), cnt);
                         touched.insert((l, new_id));
                     }
-                    if i + 1 < word.len() {
-                        let r = word[i + 1];
-                        inc_pair(&mut self.pair_freqs, (new_id, r));
+                    if i + 1 < w.tokens.len() {
+                        let r = w.tokens[i + 1];
+                        inc_pair(&mut self.pair_freqs, (new_id, r), cnt);
                         touched.insert((new_id, r));
                     }
-                    // Do NOT advance i: new_id at i cannot equal `a` again in a
-                    // way that would double-count, and staying lets an
-                    // overlapping (a,b) newly beginning at i be caught.
+                    // Do NOT advance i: staying lets an overlapping (a,b) newly
+                    // beginning at i be caught.
                 } else {
                     i += 1;
                 }
@@ -665,7 +776,7 @@ impl ConstrainedBPETrainer {
     fn script_compat(&self, a: TokenId, b: TokenId) -> bool {
         let sa = self.vocab.get_script(a);
         let sb = self.vocab.get_script(b);
-        sa == sb && matches!(sa, Script::DEV | Script::PUN | Script::LAT)
+        sa == sb && (sa == Script::DEV || sa == Script::PUN)
     }
 
     fn gate(&self, a: TokenId, b: TokenId, freq: Frequency) -> bool {
@@ -729,9 +840,23 @@ impl ConstrainedBPETrainer {
         (self.vocab.get_script(a).rank(), freq)
     }
 
-    pub fn train(&mut self, corpus: &mut Corpus) {
+    /// Train until the vocab budget is reached or no admissible merge remains.
+    /// `progress_every` merges, prints a timing/progress line to stderr (0 = off).
+    pub fn train(&mut self, corpus: &mut Corpus, progress_every: u64) {
+        let t0 = std::time::Instant::now();
+        let start_vocab = self.vocab.len();
+
         let mut heap: BinaryHeap<MergeCandidate> = BinaryHeap::new();
         self.initialize_heap(corpus, &mut heap);
+        if progress_every > 0 {
+            eprintln!(
+                "[train] heap seeded with {} admissible pairs in {:.1}s",
+                heap.len(),
+                t0.elapsed().as_secs_f64()
+            );
+        }
+
+        let mut merges: u64 = 0;
 
         while self.vocab.len() < corpus.vocab_budget {
             let mut applied = false;
@@ -770,13 +895,36 @@ impl ConstrainedBPETrainer {
                     }
                 }
 
+                merges += 1;
                 applied = true;
+
+                if progress_every > 0 && merges % progress_every == 0 {
+                    let secs = t0.elapsed().as_secs_f64();
+                    eprintln!(
+                        "[train] {} merges | vocab {} | heap {} | {:.1}s | {:.0} merges/s",
+                        merges,
+                        self.vocab.len(),
+                        heap.len(),
+                        secs,
+                        merges as f64 / secs.max(1e-9)
+                    );
+                }
                 break;
             }
 
             if !applied {
                 break; // heap exhausted of admissible pairs
             }
+        }
+
+        if progress_every > 0 {
+            eprintln!(
+                "[train] done: {} merges ({} -> {} vocab) in {:.1}s",
+                merges,
+                start_vocab,
+                self.vocab.len(),
+                t0.elapsed().as_secs_f64()
+            );
         }
     }
 
@@ -825,7 +973,60 @@ impl NepBPETokenizer {
 
     pub fn encode(&self, s: &str) -> Vec<TokenId> {
         let normalized = self.normalizer.normalize(s);
-        let mut tokens = Vec::new();
+        self.encode_normalized(&normalized)
+    }
+
+    /// Rebuild the vocab from saved (id, surface) pairs. Encode/decode-ready;
+    /// not training-ready (strict/ambiguous/roots are not restored).
+    pub fn load_vocab(&mut self, pairs: Vec<(TokenId, String)>) {
+        // Invert the byte alphabet: surface char -> byte value.
+        let mut byte_decoder: HashMap<char, u8> = HashMap::with_capacity(256);
+        for (b, &ch) in self.byte_encoder.iter().enumerate() {
+            byte_decoder.insert(ch, b as u8);
+        }
+        self.vocab.load_from_pairs(pairs, &byte_decoder);
+    }
+
+    /// One-time vocab augmentation: mint Ġ+surface merged tokens for every
+    /// existing DEV/LAT token, so greedy longest-match can hit a single merged
+    /// token for "space + common word" instead of a separate space token plus
+    /// the word's own tokens. Call once after initialize_vocab/train/load_vocab,
+    /// not per encode. Idempotent — create_merged no-ops (keeps existing id,
+    /// script, root set) if the merged surface already exists in the vocab.
+    pub fn add_space_prefixed_variants(&mut self) {
+        let space_surface = self.byte_encoder[0x20].to_string(); // "Ġ", U+0120
+        let space_id = match self.vocab.get_id_by_surface(&space_surface) {
+            Some(id) => id,
+            None => return, // byte alphabet not initialized yet
+        };
+
+        let targets: Vec<TokenId> = (0..self.vocab.len())
+            .filter(|&id| matches!(self.vocab.get_script(id), Script::DEV | Script::LAT))
+            .collect();
+
+        for id in targets {
+            let root_set = self.vocab.get_root_set(id).to_vec();
+            self.vocab.create_merged(space_id, id, root_set);
+        }
+    }
+
+    /// Tokenize text that is ALREADY normalized (N applied). The streaming
+    /// trainer normalizes a whole line once, then calls this per whitespace word
+    /// — avoiding one NFC/fold pass per word (billions of them at 12.8 GB).
+    ///
+    /// Ġ-prefix fold: this now runs in two passes. Pass 1 splits the normalized
+    /// text into (script, run) segments exactly as before. Pass 2 walks those
+    /// segments and, whenever a run is a single bare space (Script::MAL, text
+    /// == " ") immediately followed by a DEV/LAT run, folds them into one
+    /// "\u{0120}<word>" string and greedy-matches that combined string instead
+    /// of emitting the space as its own byte-fallback token. This only fires
+    /// when add_space_prefixed_variants() has populated the vocab with Ġ+word
+    /// merged surfaces — otherwise greedy match still degrades gracefully to
+    /// "Ġ" alone (byte fallback) plus the word's normal tokenization, so this
+    /// is safe to enable unconditionally.
+    pub fn encode_normalized(&self, normalized: &str) -> Vec<TokenId> {
+        // Pass 1: split into (script, run) pairs, same grouping logic as before.
+        let mut runs: Vec<(Script, String)> = Vec::new();
         let mut current_run = String::new();
         let mut current_script: Option<Script> = None;
 
@@ -838,21 +1039,37 @@ impl NepBPETokenizer {
                 }
                 _ => {
                     if !current_run.is_empty() {
-                        if let Some(cs) = current_script {
-                            self.tokenize_run(&current_run, cs, &mut tokens);
-                        }
-                        current_run.clear();
+                        runs.push((current_script.unwrap(), std::mem::take(&mut current_run)));
                     }
                     current_run.push(ch);
                     current_script = Some(ch_script);
                 }
             }
         }
-
         if !current_run.is_empty() {
-            if let Some(cs) = current_script {
-                self.tokenize_run(&current_run, cs, &mut tokens);
+            runs.push((current_script.unwrap(), current_run));
+        }
+
+        // Pass 2: fold a single trailing space off a MAL run into a Ġ prefix on
+        // the immediately following DEV/LAT run, then tokenize.
+        let mut tokens = Vec::new();
+        let mut i = 0;
+        while i < runs.len() {
+            let (script, text) = &runs[i];
+
+            if *script == Script::MAL
+                && text == "\u{0020}" // exactly one bare space, nothing else in this run
+                && i + 1 < runs.len()
+                && matches!(runs[i + 1].0, Script::DEV | Script::LAT)
+            {
+                let combined = format!("\u{0120}{}", runs[i + 1].1);
+                self.tokenize_greedy(&combined, &mut tokens);
+                i += 2;
+                continue;
             }
+
+            self.tokenize_run(text, *script, &mut tokens);
+            i += 1;
         }
 
         tokens
@@ -874,16 +1091,14 @@ impl NepBPETokenizer {
 
     fn tokenize_run(&self, run: &str, script: Script, tokens: &mut Vec<TokenId>) {
         match script {
-            Script::DEV => {
-                let aksharas = self.akshara_dfa.tokenize(run);
-                for akshara in aksharas {
-                    if let Some(id) = self.vocab.get_id_by_surface(&akshara.surface) {
-                        tokens.push(id);
-                    } else {
-                        self.fallback_tokenize_dev(&akshara.surface, tokens);
-                    }
-                }
-            }
+            // DEV now uses greedy longest-match over the vocab, so the learned
+            // merges are actually applied at encode time. (The old code emitted
+            // one token per codepoint via the empty DFA and never consulted the
+            // merged surfaces — that was the ~5.6-tokens/word bug.) When the DFA
+            // is populated you may instead want to segment to aksharas first and
+            // greedy-match at akshara granularity to keep the hard conjunct
+            // guarantee; char-level greedy is what matches the trained vocab.
+            Script::DEV | Script::LAT => self.tokenize_greedy(run, tokens),
             Script::PUN => {
                 for ch in run.chars() {
                     if let Some(id) = self.vocab.get_id_by_surface(&ch.to_string()) {
@@ -901,28 +1116,34 @@ impl NepBPETokenizer {
             Script::MAL => {
                 self.emit_byte_fallback(run.as_bytes(), tokens);
             }
-            Script::LAT => {
-                // Longest vocabulary match first; single chars resolve to their
-                // byte-alphabet token via surface lookup (e.g. 'h' -> byte 0x68).
-                let chars: Vec<char> = run.chars().collect();
-                let mut i = 0;
-                while i < chars.len() {
-                    let mut found = false;
-                    for len in (1..=chars.len() - i).rev() {
-                        let candidate: String = chars[i..i + len].iter().collect();
-                        if let Some(id) = self.vocab.get_id_by_surface(&candidate) {
-                            tokens.push(id);
-                            i += len;
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        let ch_str = chars[i].to_string();
-                        self.emit_byte_fallback(ch_str.as_bytes(), tokens);
-                        i += 1;
-                    }
+        }
+    }
+
+    /// Greedy longest-match over vocab surfaces, capped at the longest known
+    /// surface length; misses fall through to per-byte fallback. Used for both
+    /// DEV and LAT runs, and for Ġ-prefixed combined strings.
+    fn tokenize_greedy(&self, run: &str, tokens: &mut Vec<TokenId>) {
+        let chars: Vec<char> = run.chars().collect();
+        let n = chars.len();
+        let cap = self.vocab.max_surface_len().max(1);
+        let mut i = 0;
+        while i < n {
+            let hi = n.min(i + cap);
+            let mut matched = false;
+            for j in (i + 1..=hi).rev() {
+                let candidate: String = chars[i..j].iter().collect();
+                if let Some(id) = self.vocab.get_id_by_surface(&candidate) {
+                    tokens.push(id);
+                    i = j;
+                    matched = true;
+                    break;
                 }
+            }
+            if !matched {
+                // Single char not in vocab -> spell it out in byte fallback.
+                let ch_str = chars[i].to_string();
+                self.emit_byte_fallback(ch_str.as_bytes(), tokens);
+                i += 1;
             }
         }
     }
@@ -937,39 +1158,17 @@ impl NepBPETokenizer {
         }
     }
 
-    fn fallback_tokenize_dev(&self, text: &str, tokens: &mut Vec<TokenId>) {
-        let chars: Vec<char> = text.chars().collect();
-        let mut i = 0;
-
-        while i < chars.len() {
-            let mut found = false;
-            for len in (2..=chars.len() - i).rev() {
-                let candidate: String = chars[i..i + len].iter().collect();
-                if let Some(id) = self.vocab.get_id_by_surface(&candidate) {
-                    tokens.push(id);
-                    i += len;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                let ch = chars[i];
-                let ch_str = ch.to_string();
-                if let Some(id) = self.vocab.get_id_by_surface(&ch_str) {
-                    tokens.push(id);
-                } else {
-                    self.emit_byte_fallback(ch_str.as_bytes(), tokens);
-                }
-                i += 1;
-            }
-        }
-    }
-
     /// Blocker 2 + decode-by-type: reconstruct bytes from ByteFallback tokens
     /// (detected by TYPE, not surface, so it is independent of the byte
     /// alphabet), and preserve ZWNJ verbatim (NO surface skip). Flushes buffered
     /// bytes with from_utf8_lossy so a model-generated arbitrary byte stream
     /// degrades gracefully instead of dropping a whole run.
+    ///
+    /// Ġ-prefix fix: any non-byte-fallback token whose surface starts with
+    /// U+0120 ('Ġ') is a space-prefixed merged token minted by
+    /// add_space_prefixed_variants(); decode strips the Ġ and emits a real
+    /// space instead. U+0120 never appears in this tokenizer except as that
+    /// marker, so the strip is unambiguous.
     pub fn decode(&self, token_ids: &[TokenId]) -> String {
         let mut result = String::new();
         let mut byte_buf: Vec<u8> = Vec::new();
@@ -984,7 +1183,12 @@ impl NepBPETokenizer {
                         result.push_str(&String::from_utf8_lossy(&std::mem::take(&mut byte_buf)));
                     }
                     if let Some(surface) = self.vocab.get_surface(id) {
-                        result.push_str(&surface); // ZWNJ included, like any other surface
+                        if let Some(rest) = surface.strip_prefix('\u{0120}') {
+                            result.push(' ');
+                            result.push_str(rest);
+                        } else {
+                            result.push_str(&surface); // ZWNJ included, like any other surface
+                        }
                     }
                 }
                 None => {
@@ -1020,7 +1224,8 @@ pub struct PyNepBPETokenizer {
 #[pymethods]
 impl PyNepBPETokenizer {
     /// Blocker 4: pass folding rules as a list of (pattern, replacement) string
-    /// pairs, e.g. [("सङ्ग", "संग"), ("सँग", "संग")], instead of a char->char dict.
+    /// pairs, e.g. [("सङ्ग", "संग"), ("सँग", "संग")], instead of a char->char
+    /// dict.
     #[new]
     #[pyo3(signature = (folding_rules=None))]
     fn new(folding_rules: Option<Vec<(String, String)>>) -> PyResult<Self> {
@@ -1036,6 +1241,14 @@ impl PyNepBPETokenizer {
 
     fn encode(&self, text: &str) -> PyResult<Vec<usize>> {
         Ok(self.inner.encode(text))
+    }
+
+    /// One-time call after initialize_vocab/train_*/load_vocab* to enable
+    /// Ġ-prefixed space folding. Safe to call multiple times (idempotent);
+    /// cheap to call again after further training since it only adds surfaces
+    /// that don't already exist.
+    fn add_space_prefixed_variants(&mut self) {
+        self.inner.add_space_prefixed_variants();
     }
 
     fn decode(&self, ids: Vec<usize>) -> String {
@@ -1156,18 +1369,118 @@ impl PyNepBPETokenizer {
             .vocab
             .assign_roots_from_registry(&self.inner.paradigm_registry);
 
-        let mut corpus = Corpus::new(sequences, vocab_budget);
+        let mut corpus = Corpus::from_sequences(sequences, vocab_budget);
         let mut trainer = ConstrainedBPETrainer::new(
             std::mem::take(&mut self.inner.vocab),
             std::mem::take(&mut self.inner.paradigm_registry),
         );
         trainer.theta = theta;
-        trainer.train(&mut corpus);
+        trainer.train(&mut corpus, 0);
 
         self.inner.vocab = trainer.vocab;
         self.inner.paradigm_registry = trainer.paradigm_registry;
 
         Ok(self.inner.vocab.len())
+    }
+
+    /// Streaming, word-deduplicated training over a text file — the path to use
+    /// for large corpora (multi-GB). Reads the file line by line, so peak RAM is
+    /// the word-frequency dictionary, NOT the tokenized corpus.
+    ///
+    /// - `min_word_freq`: drop word types occurring fewer than this many times
+    ///   (cuts the huge hapax tail of morphologically rich Nepali; 1 = keep all).
+    /// - `progress_lines`: print a build-progress line every N input lines (0=off).
+    /// - `progress_merges`: print a train-progress line every N merges (0=off).
+    ///
+    /// Timing for the build phase and the train phase is printed to stderr. The
+    /// return value is the final vocab size.
+    #[pyo3(signature = (path, vocab_budget, theta, min_word_freq=1, progress_lines=500000, progress_merges=1000))]
+    fn train_from_file(
+        &mut self,
+        py: Python<'_>,
+        path: String,
+        vocab_budget: usize,
+        theta: u64,
+        min_word_freq: u64,
+        progress_lines: u64,
+        progress_merges: u64,
+    ) -> PyResult<usize> {
+        use std::fs::File;
+        use std::io::{BufRead, BufReader};
+        use std::time::Instant;
+
+        let file = File::open(&path).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("open {}: {}", path, e))
+        })?;
+
+        // Release the GIL for the whole heavy phase; we only touch pure-Rust state.
+        let (counts, lines_done, word_occ, build_secs) = py.allow_threads(|| {
+            let t0 = Instant::now();
+            let reader = BufReader::with_capacity(1 << 20, file);
+            let mut counts: HashMap<Vec<TokenId>, Frequency> = HashMap::new();
+            let mut lines_done: u64 = 0;
+            let mut word_occ: u64 = 0;
+
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => continue, // skip unreadable line rather than abort a long job
+                };
+                let norm = self.inner.normalizer.normalize(&line);
+                for word in norm.split_whitespace() {
+                    let toks = self.inner.encode_normalized(word);
+                    if !toks.is_empty() {
+                        *counts.entry(toks).or_insert(0) += 1;
+                        word_occ += 1;
+                    }
+                }
+                lines_done += 1;
+                if progress_lines > 0 && lines_done % progress_lines == 0 {
+                    eprintln!(
+                        "[build] {} lines | {} word-occ | {} unique | {:.1}s",
+                        lines_done,
+                        word_occ,
+                        counts.len(),
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+            }
+
+            if min_word_freq > 1 {
+                counts.retain(|_, &mut c| c >= min_word_freq);
+            }
+            (counts, lines_done, word_occ, t0.elapsed().as_secs_f64())
+        });
+
+        eprintln!(
+            "[build] done: {} lines, {} word-occ, {} unique types kept (min_freq={}) in {:.1}s",
+            lines_done,
+            word_occ,
+            counts.len(),
+            min_word_freq,
+            build_secs
+        );
+
+        // Tag roots (no-op unless paradigms loaded), then train (GIL released).
+        self.inner
+            .vocab
+            .assign_roots_from_registry(&self.inner.paradigm_registry);
+
+        let final_vocab = py.allow_threads(|| {
+            let mut corpus = Corpus::from_word_counts(counts, vocab_budget);
+            let mut trainer = ConstrainedBPETrainer::new(
+                std::mem::take(&mut self.inner.vocab),
+                std::mem::take(&mut self.inner.paradigm_registry),
+            );
+            trainer.theta = theta;
+            trainer.train(&mut corpus, progress_merges);
+
+            self.inner.vocab = trainer.vocab;
+            self.inner.paradigm_registry = trainer.paradigm_registry;
+            self.inner.vocab.len()
+        });
+
+        Ok(final_vocab)
     }
 
     fn train_from_text(
@@ -1191,6 +1504,50 @@ impl PyNepBPETokenizer {
 
     fn vocab_size(&self) -> usize {
         self.inner.vocab.len()
+    }
+
+    /// Rebuild the vocab from (id, surface) pairs — encode/decode-ready, not
+    /// training-ready. Ids must be contiguous 0..N.
+    fn load_vocab(&mut self, pairs: Vec<(usize, String)>) -> PyResult<usize> {
+        self.inner.load_vocab(pairs);
+        Ok(self.inner.vocab.len())
+    }
+
+    /// Load the vocab from a TSV written by the training driver ("id\tsurface"),
+    /// reversing the tab/newline/backslash escaping. Encode/decode-ready.
+    fn load_vocab_tsv(&mut self, path: String) -> PyResult<usize> {
+        use std::fs::File;
+        use std::io::{BufRead, BufReader};
+
+        let file = File::open(&path).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("open {}: {}", path, e))
+        })?;
+        let reader = BufReader::new(file);
+
+        let mut pairs: Vec<(usize, String)> = Vec::new();
+        for line in reader.lines() {
+            let line = line.map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("read: {}", e))
+            })?;
+            if line.is_empty() {
+                continue;
+            }
+            let mut it = line.splitn(2, '\t');
+            let id_str = match it.next() {
+                Some(s) => s,
+                None => continue,
+            };
+            let surf_raw = it.next().unwrap_or("");
+            let id: usize = match id_str.parse() {
+                Ok(v) => v,
+                Err(_) => continue, // skip a malformed line rather than abort
+            };
+            let surface = unescape_tsv(surf_raw);
+            pairs.push((id, surface));
+        }
+
+        self.inner.load_vocab(pairs);
+        Ok(self.inner.vocab.len())
     }
 
     fn get_token_surface(&self, id: usize) -> PyResult<String> {
