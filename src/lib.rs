@@ -987,46 +987,11 @@ impl NepBPETokenizer {
         self.vocab.load_from_pairs(pairs, &byte_decoder);
     }
 
-    /// One-time vocab augmentation: mint Ġ+surface merged tokens for every
-    /// existing DEV/LAT token, so greedy longest-match can hit a single merged
-    /// token for "space + common word" instead of a separate space token plus
-    /// the word's own tokens. Call once after initialize_vocab/train/load_vocab,
-    /// not per encode. Idempotent — create_merged no-ops (keeps existing id,
-    /// script, root set) if the merged surface already exists in the vocab.
-    pub fn add_space_prefixed_variants(&mut self) {
-        let space_surface = self.byte_encoder[0x20].to_string(); // "Ġ", U+0120
-        let space_id = match self.vocab.get_id_by_surface(&space_surface) {
-            Some(id) => id,
-            None => return, // byte alphabet not initialized yet
-        };
-
-        let targets: Vec<TokenId> = (0..self.vocab.len())
-            .filter(|&id| matches!(self.vocab.get_script(id), Script::DEV | Script::LAT))
-            .collect();
-
-        for id in targets {
-            let root_set = self.vocab.get_root_set(id).to_vec();
-            self.vocab.create_merged(space_id, id, root_set);
-        }
-    }
-
     /// Tokenize text that is ALREADY normalized (N applied). The streaming
     /// trainer normalizes a whole line once, then calls this per whitespace word
     /// — avoiding one NFC/fold pass per word (billions of them at 12.8 GB).
-    ///
-    /// Ġ-prefix fold: this now runs in two passes. Pass 1 splits the normalized
-    /// text into (script, run) segments exactly as before. Pass 2 walks those
-    /// segments and, whenever a run is a single bare space (Script::MAL, text
-    /// == " ") immediately followed by a DEV/LAT run, folds them into one
-    /// "\u{0120}<word>" string and greedy-matches that combined string instead
-    /// of emitting the space as its own byte-fallback token. This only fires
-    /// when add_space_prefixed_variants() has populated the vocab with Ġ+word
-    /// merged surfaces — otherwise greedy match still degrades gracefully to
-    /// "Ġ" alone (byte fallback) plus the word's normal tokenization, so this
-    /// is safe to enable unconditionally.
     pub fn encode_normalized(&self, normalized: &str) -> Vec<TokenId> {
-        // Pass 1: split into (script, run) pairs, same grouping logic as before.
-        let mut runs: Vec<(Script, String)> = Vec::new();
+        let mut tokens = Vec::new();
         let mut current_run = String::new();
         let mut current_script: Option<Script> = None;
 
@@ -1039,37 +1004,21 @@ impl NepBPETokenizer {
                 }
                 _ => {
                     if !current_run.is_empty() {
-                        runs.push((current_script.unwrap(), std::mem::take(&mut current_run)));
+                        if let Some(cs) = current_script {
+                            self.tokenize_run(&current_run, cs, &mut tokens);
+                        }
+                        current_run.clear();
                     }
                     current_run.push(ch);
                     current_script = Some(ch_script);
                 }
             }
         }
+
         if !current_run.is_empty() {
-            runs.push((current_script.unwrap(), current_run));
-        }
-
-        // Pass 2: fold a single trailing space off a MAL run into a Ġ prefix on
-        // the immediately following DEV/LAT run, then tokenize.
-        let mut tokens = Vec::new();
-        let mut i = 0;
-        while i < runs.len() {
-            let (script, text) = &runs[i];
-
-            if *script == Script::MAL
-                && text == "\u{0020}" // exactly one bare space, nothing else in this run
-                && i + 1 < runs.len()
-                && matches!(runs[i + 1].0, Script::DEV | Script::LAT)
-            {
-                let combined = format!("\u{0120}{}", runs[i + 1].1);
-                self.tokenize_greedy(&combined, &mut tokens);
-                i += 2;
-                continue;
+            if let Some(cs) = current_script {
+                self.tokenize_run(&current_run, cs, &mut tokens);
             }
-
-            self.tokenize_run(text, *script, &mut tokens);
-            i += 1;
         }
 
         tokens
@@ -1121,7 +1070,7 @@ impl NepBPETokenizer {
 
     /// Greedy longest-match over vocab surfaces, capped at the longest known
     /// surface length; misses fall through to per-byte fallback. Used for both
-    /// DEV and LAT runs, and for Ġ-prefixed combined strings.
+    /// DEV and LAT runs.
     fn tokenize_greedy(&self, run: &str, tokens: &mut Vec<TokenId>) {
         let chars: Vec<char> = run.chars().collect();
         let n = chars.len();
@@ -1163,12 +1112,6 @@ impl NepBPETokenizer {
     /// alphabet), and preserve ZWNJ verbatim (NO surface skip). Flushes buffered
     /// bytes with from_utf8_lossy so a model-generated arbitrary byte stream
     /// degrades gracefully instead of dropping a whole run.
-    ///
-    /// Ġ-prefix fix: any non-byte-fallback token whose surface starts with
-    /// U+0120 ('Ġ') is a space-prefixed merged token minted by
-    /// add_space_prefixed_variants(); decode strips the Ġ and emits a real
-    /// space instead. U+0120 never appears in this tokenizer except as that
-    /// marker, so the strip is unambiguous.
     pub fn decode(&self, token_ids: &[TokenId]) -> String {
         let mut result = String::new();
         let mut byte_buf: Vec<u8> = Vec::new();
@@ -1183,12 +1126,7 @@ impl NepBPETokenizer {
                         result.push_str(&String::from_utf8_lossy(&std::mem::take(&mut byte_buf)));
                     }
                     if let Some(surface) = self.vocab.get_surface(id) {
-                        if let Some(rest) = surface.strip_prefix('\u{0120}') {
-                            result.push(' ');
-                            result.push_str(rest);
-                        } else {
-                            result.push_str(&surface); // ZWNJ included, like any other surface
-                        }
+                        result.push_str(&surface); // ZWNJ included, like any other surface
                     }
                 }
                 None => {
@@ -1224,8 +1162,7 @@ pub struct PyNepBPETokenizer {
 #[pymethods]
 impl PyNepBPETokenizer {
     /// Blocker 4: pass folding rules as a list of (pattern, replacement) string
-    /// pairs, e.g. [("सङ्ग", "संग"), ("सँग", "संग")], instead of a char->char
-    /// dict.
+    /// pairs, e.g. [("सङ्ग", "संग"), ("सँग", "संग")], instead of a char->char dict.
     #[new]
     #[pyo3(signature = (folding_rules=None))]
     fn new(folding_rules: Option<Vec<(String, String)>>) -> PyResult<Self> {
@@ -1241,14 +1178,6 @@ impl PyNepBPETokenizer {
 
     fn encode(&self, text: &str) -> PyResult<Vec<usize>> {
         Ok(self.inner.encode(text))
-    }
-
-    /// One-time call after initialize_vocab/train_*/load_vocab* to enable
-    /// Ġ-prefixed space folding. Safe to call multiple times (idempotent);
-    /// cheap to call again after further training since it only adds surfaces
-    /// that don't already exist.
-    fn add_space_prefixed_variants(&mut self) {
-        self.inner.add_space_prefixed_variants();
     }
 
     fn decode(&self, ids: Vec<usize>) -> String {

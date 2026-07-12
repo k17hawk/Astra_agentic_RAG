@@ -214,3 +214,4 @@ doc_verctor_store/
 *.xz
 en.gz
 en
+*.tsv
