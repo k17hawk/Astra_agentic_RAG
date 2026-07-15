@@ -3,7 +3,8 @@ import statistics
 import time
 from tiny_llm_scratch_with_tokenizer import PyNepBPETokenizer
 
-VOCAB_TSV = "dataset_ne/nepbpe_vocab_new.tsv"
+VOCAB_TSV = 'nepbpe_vocab_bilingual_new.tsv'
+#"dataset_ne/nepbpe_vocab_new.tsv"
 
 # MUST be identical to what you trained with (train.py). If these differ,
 # normalization drifts and surface lookups miss.

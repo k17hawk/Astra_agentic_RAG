@@ -252,6 +252,11 @@ pub enum Token {
     ByteFallback(ByteVal),
     SeededMorpheme(String),
     MergedToken(Vec<TokenId>),
+    /// Latin/ASCII alphanumeric base unit (Phase 4). These MUST exist as their
+    /// own script class: if 'h' were only a ByteFallback token its script would
+    /// be MAL, and the Gate's atomic-class clause would forbid every Latin
+    /// merge. Seeded before the byte alphabet so it wins the surface key.
+    Latin(String),
     /// Reconstructed from a saved vocab (surface only, no merge/child history).
     /// Enough for encode + decode; NOT enough to correctly resume training.
     Loaded(String),
@@ -270,6 +275,7 @@ impl Token {
             Token::ByteFallback(_) => Script::MAL,
             Token::SeededMorpheme(_) => Script::DEV,
             Token::MergedToken(_) => Script::DEV,
+            Token::Latin(_) => Script::LAT,
             Token::Loaded(_) => Script::DEV,
         }
     }
@@ -323,11 +329,20 @@ impl Vocabulary {
             let token = Arc::new(Token::Punctuation(punct));
             self.add_token(token, surface, false, false);
         }
-        // Byte-fallback alphabet, GPT-2 style. Punctuation is added *before*
-        // this, so an ASCII-graphic byte that collides with a punctuation
-        // surface (e.g. '<') aliases to the PUN token; this is harmless — the
-        // surface still decodes correctly, and single-byte ASCII never appears
-        // as a UTF-8 continuation byte, so the multibyte flush is unaffected.
+        // Phase 4 base alphabet: Latin letters + ASCII digits as LAT-scripted
+        // tokens. Seeded BEFORE the byte alphabet so these surfaces resolve to
+        // LAT (mergeable) rather than MAL byte tokens (never mergeable).
+        for ch in ('a'..='z').chain('A'..='Z').chain('0'..='9') {
+            let surface = ch.to_string();
+            let token = Arc::new(Token::Latin(surface.clone()));
+            self.add_token(token, surface, false, false);
+        }
+
+        // Byte-fallback alphabet, GPT-2 style. Punctuation and Latin are added
+        // *before* this, so an ASCII-graphic byte that collides with an existing
+        // surface aliases to that token; harmless — the surface still decodes
+        // correctly, and single-byte ASCII never appears as a UTF-8 continuation
+        // byte, so the multibyte flush is unaffected.
         for byte_val in 0u8..=255 {
             let surface = byte_encoder[byte_val as usize].to_string();
             let token = Arc::new(Token::ByteFallback(byte_val));
@@ -425,15 +440,22 @@ impl Vocabulary {
             let id = self.tokens.len();
             debug_assert_eq!(id, expected_id, "vocab ids must be contiguous from 0");
 
-            // A single char that lives in the byte alphabet is a byte token.
-            // (Merged surfaces are always >= 2 chars, so this never misfires on
-            // a real merge.)
+            // Classify the surface. Order matters: Latin/digit chars are checked
+            // BEFORE the byte alphabet, because 'a' is both a valid Latin base
+            // token and byte 0x61 — it must come back as LAT (mergeable), not
+            // MAL. Merged surfaces are always >= 2 chars, so the single-char
+            // checks never misfire on a real merge.
             let mut token = Arc::new(Token::Loaded(surface.clone()));
-            if surface.chars().count() == 1 {
-                let ch = surface.chars().next().unwrap();
-                if let Some(&b) = byte_decoder.get(&ch) {
+            let mut chs = surface.chars();
+            if let (Some(ch), None) = (chs.next(), chs.next()) {
+                if ch.is_ascii_alphanumeric() {
+                    token = Arc::new(Token::Latin(surface.clone()));
+                } else if let Some(&b) = byte_decoder.get(&ch) {
                     token = Arc::new(Token::ByteFallback(b));
                 }
+            } else if surface.chars().all(|c| c.is_ascii_alphanumeric()) {
+                // Multi-char pure-ASCII surface = a Latin merge from Phase 4.
+                token = Arc::new(Token::Latin(surface.clone()));
             }
 
             let clen = surface.chars().count();
@@ -762,6 +784,11 @@ pub struct ConstrainedBPETrainer {
     vocab: Vocabulary,
     paradigm_registry: ParadigmRegistry,
     pub theta: Frequency,
+    /// PHASE 4. When true this is the Latin secondary pass: unconstrained BPE
+    /// over LAT runs only. No V_seed/V_strict/V_ambiguous (those are Devanagari
+    /// morphemes) and no Morph (no paradigms for English) — pure frequency.
+    /// When false it is the Phase-3 constrained Devanagari pass, unchanged.
+    pub latin_pass: bool,
 }
 
 impl ConstrainedBPETrainer {
@@ -770,12 +797,19 @@ impl ConstrainedBPETrainer {
             vocab,
             paradigm_registry,
             theta: 100,
+            latin_pass: false,
         }
     }
 
     fn script_compat(&self, a: TokenId, b: TokenId) -> bool {
         let sa = self.vocab.get_script(a);
         let sb = self.vocab.get_script(b);
+        if self.latin_pass {
+            // Phase 4: Latin only. Fully separate from the DEV vocabulary, so no
+            // DEV/LAT token can ever form (the v2 "no token spans two scripts"
+            // guarantee still holds).
+            return sa == sb && sa == Script::LAT;
+        }
         sa == sb && (sa == Script::DEV || sa == Script::PUN)
     }
 
@@ -788,6 +822,9 @@ impl ConstrainedBPETrainer {
         }
         if !self.script_compat(a, b) {
             return false;
+        }
+        if self.latin_pass {
+            return true; // unconstrained: frequency alone decides
         }
         if self.vocab.is_strict(b) || self.vocab.is_ambiguous(b) {
             return false;
@@ -802,6 +839,9 @@ impl ConstrainedBPETrainer {
     }
 
     fn morph(&self, a: TokenId, b: TokenId) -> bool {
+        if self.latin_pass {
+            return true; // no paradigms for Latin
+        }
         let root_set = self.vocab.get_root_set(a);
         if root_set.is_empty() {
             return true; // non-paradigm token: defer to Gate + Freq (§3.2 fix #2)
@@ -819,6 +859,9 @@ impl ConstrainedBPETrainer {
     }
 
     fn narrow_root_set(&self, a: TokenId, b: TokenId) -> Vec<RootId> {
+        if self.latin_pass {
+            return Vec::new();
+        }
         let root_set_a = self.vocab.get_root_set(a);
         if root_set_a.is_empty() {
             return Vec::new();
@@ -840,17 +883,21 @@ impl ConstrainedBPETrainer {
         (self.vocab.get_script(a).rank(), freq)
     }
 
-    /// Train until the vocab budget is reached or no admissible merge remains.
-    /// `progress_every` merges, prints a timing/progress line to stderr (0 = off).
-    pub fn train(&mut self, corpus: &mut Corpus, progress_every: u64) {
+    /// Train until `budget` (total vocab size) is reached or no admissible merge
+    /// remains. `progress_every` merges, prints a timing line to stderr (0=off).
+    /// The budget is a TOTAL vocab-size target, not a merge count — so for the
+    /// Phase-4 pass you pass (dev_budget + lat_budget).
+    pub fn train(&mut self, corpus: &mut Corpus, budget: usize, progress_every: u64) {
         let t0 = std::time::Instant::now();
         let start_vocab = self.vocab.len();
+        let tag = if self.latin_pass { "LAT" } else { "DEV" };
 
         let mut heap: BinaryHeap<MergeCandidate> = BinaryHeap::new();
         self.initialize_heap(corpus, &mut heap);
         if progress_every > 0 {
             eprintln!(
-                "[train] heap seeded with {} admissible pairs in {:.1}s",
+                "[train:{}] heap seeded with {} admissible pairs in {:.1}s",
+                tag,
                 heap.len(),
                 t0.elapsed().as_secs_f64()
             );
@@ -858,7 +905,7 @@ impl ConstrainedBPETrainer {
 
         let mut merges: u64 = 0;
 
-        while self.vocab.len() < corpus.vocab_budget {
+        while self.vocab.len() < budget {
             let mut applied = false;
 
             while let Some(candidate) = heap.pop() {
@@ -901,7 +948,8 @@ impl ConstrainedBPETrainer {
                 if progress_every > 0 && merges % progress_every == 0 {
                     let secs = t0.elapsed().as_secs_f64();
                     eprintln!(
-                        "[train] {} merges | vocab {} | heap {} | {:.1}s | {:.0} merges/s",
+                        "[train:{}] {} merges | vocab {} | heap {} | {:.1}s | {:.0} merges/s",
+                        tag,
                         merges,
                         self.vocab.len(),
                         heap.len(),
@@ -919,7 +967,8 @@ impl ConstrainedBPETrainer {
 
         if progress_every > 0 {
             eprintln!(
-                "[train] done: {} merges ({} -> {} vocab) in {:.1}s",
+                "[train:{}] done: {} merges ({} -> {} vocab) in {:.1}s",
+                tag,
                 merges,
                 start_vocab,
                 self.vocab.len(),
@@ -1304,7 +1353,7 @@ impl PyNepBPETokenizer {
             std::mem::take(&mut self.inner.paradigm_registry),
         );
         trainer.theta = theta;
-        trainer.train(&mut corpus, 0);
+        trainer.train(&mut corpus, vocab_budget, 0);
 
         self.inner.vocab = trainer.vocab;
         self.inner.paradigm_registry = trainer.paradigm_registry;
@@ -1402,7 +1451,7 @@ impl PyNepBPETokenizer {
                 std::mem::take(&mut self.inner.paradigm_registry),
             );
             trainer.theta = theta;
-            trainer.train(&mut corpus, progress_merges);
+            trainer.train(&mut corpus, vocab_budget, progress_merges);
 
             self.inner.vocab = trainer.vocab;
             self.inner.paradigm_registry = trainer.paradigm_registry;
@@ -1429,6 +1478,124 @@ impl PyNepBPETokenizer {
         }
 
         self.train_bpe(sequences, vocab_budget, theta)
+    }
+
+    /// PHASE 4 — bilingual training. Builds the word-frequency dictionary ONCE
+    /// from a mixed Nepali+English file, then runs two passes over it:
+    ///
+    ///   1. Phase 3 (constrained): Devanagari + punctuation, up to `dev_budget`.
+    ///   2. Phase 4 (unconstrained): Latin/digits only, up to
+    ///      `dev_budget + lat_budget` total.
+    ///
+    /// The budget split is an explicit CHOICE, not a default. Nepali is the
+    /// priority language and needs the larger slice; English reaches acceptable
+    /// fertility with far fewer slots (its high-frequency subword core is small).
+    /// A reasonable start is dev=40000, lat=8000.
+    ///
+    /// Script separation is preserved: no DEV/LAT token can ever form, because
+    /// each pass's ScriptCompat admits only its own script.
+    #[pyo3(signature = (path, dev_budget, lat_budget, theta, min_word_freq=1, progress_lines=500000, progress_merges=1000))]
+    fn train_bilingual_from_file(
+        &mut self,
+        py: Python<'_>,
+        path: String,
+        dev_budget: usize,
+        lat_budget: usize,
+        theta: u64,
+        min_word_freq: u64,
+        progress_lines: u64,
+        progress_merges: u64,
+    ) -> PyResult<usize> {
+        use std::fs::File;
+        use std::io::{BufRead, BufReader};
+        use std::time::Instant;
+
+        let file = File::open(&path).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("open {}: {}", path, e))
+        })?;
+
+        let (counts, lines_done, word_occ, build_secs) = py.allow_threads(|| {
+            let t0 = Instant::now();
+            let reader = BufReader::with_capacity(1 << 20, file);
+            let mut counts: HashMap<Vec<TokenId>, Frequency> = HashMap::new();
+            let mut lines_done: u64 = 0;
+            let mut word_occ: u64 = 0;
+
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                let norm = self.inner.normalizer.normalize(&line);
+                for word in norm.split_whitespace() {
+                    let toks = self.inner.encode_normalized(word);
+                    if !toks.is_empty() {
+                        *counts.entry(toks).or_insert(0) += 1;
+                        word_occ += 1;
+                    }
+                }
+                lines_done += 1;
+                if progress_lines > 0 && lines_done % progress_lines == 0 {
+                    eprintln!(
+                        "[build] {} lines | {} word-occ | {} unique | {:.1}s",
+                        lines_done,
+                        word_occ,
+                        counts.len(),
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+            }
+            if min_word_freq > 1 {
+                counts.retain(|_, &mut c| c >= min_word_freq);
+            }
+            (counts, lines_done, word_occ, t0.elapsed().as_secs_f64())
+        });
+
+        eprintln!(
+            "[build] done: {} lines, {} word-occ, {} unique types kept (min_freq={}) in {:.1}s",
+            lines_done, word_occ, counts.len(), min_word_freq, build_secs
+        );
+
+        self.inner
+            .vocab
+            .assign_roots_from_registry(&self.inner.paradigm_registry);
+
+        let total_budget = dev_budget + lat_budget;
+
+        let final_vocab = py.allow_threads(|| {
+            let mut corpus = Corpus::from_word_counts(counts, total_budget);
+            let mut trainer = ConstrainedBPETrainer::new(
+                std::mem::take(&mut self.inner.vocab),
+                std::mem::take(&mut self.inner.paradigm_registry),
+            );
+            trainer.theta = theta;
+
+            // Pass 1 — Phase 3, constrained, Devanagari + punctuation.
+            trainer.latin_pass = false;
+            trainer.train(&mut corpus, dev_budget, progress_merges);
+            let after_dev = trainer.vocab.len();
+
+            // Pass 2 — Phase 4, unconstrained, Latin only. The heap is rebuilt
+            // from scratch inside train(), and initialize_heap now admits LAT
+            // pairs because script_compat flipped.
+            trainer.latin_pass = true;
+            trainer.train(&mut corpus, total_budget, progress_merges);
+            let after_lat = trainer.vocab.len();
+
+            eprintln!(
+                "[train] budget split: DEV {} (target {}) | LAT +{} (target +{})",
+                after_dev,
+                dev_budget,
+                after_lat - after_dev,
+                lat_budget
+            );
+
+            self.inner.vocab = trainer.vocab;
+            self.inner.paradigm_registry = trainer.paradigm_registry;
+            self.inner.vocab.len()
+        });
+
+        Ok(final_vocab)
     }
 
     fn vocab_size(&self) -> usize {

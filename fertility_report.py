@@ -20,7 +20,8 @@ import unicodedata
 from collections import Counter
 from tiny_llm_scratch_with_tokenizer import PyNepBPETokenizer
 
-VOCAB_TSV = "nepbpe_vocab.tsv"
+VOCAB_TSV = 'nepbpe_vocab_bilingual_new.tsv'
+#"nepbpe_vocab.tsv"
 FOLDING_RULES = [("सङ्ग", "संग"), ("सँग", "संग")]
 SPACE_PIECE = "\u0120"
 
