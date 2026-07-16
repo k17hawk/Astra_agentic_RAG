@@ -3,7 +3,7 @@ import statistics
 import time
 from tiny_llm_scratch_with_tokenizer import PyNepBPETokenizer
 
-VOCAB_TSV = 'nepbpe_vocab_bilingual_new.tsv'
+VOCAB_TSV = 'dataset_ne/nepbpe_vocab_new.tsv'
 #"dataset_ne/nepbpe_vocab_new.tsv"
 
 # MUST be identical to what you trained with (train.py). If these differ,
@@ -48,6 +48,8 @@ SAMPLES = [
     "फेरि पनि तिमी नै मेरो रोजाइ हुनेछौ",
     "यस जन्मझैं, त्यो जन्ममा पनि",
     "मेरो हरेक प्रार्थनाको उत्तर तिमी नै हुनेछौ",
+   ' नेपाल (आधिकारिक नाम: सङ्घीय लोकतान्त्रिक गणतन्त्र नेपाल)',
+   'we are venome'
 ]
 
 

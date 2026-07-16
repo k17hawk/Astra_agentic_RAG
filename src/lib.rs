@@ -16,14 +16,52 @@ type ByteVal = u8;
 type Frequency = u64;
 
 // ============================================================================
+// Space marking + extended punctuation (FIX #1 and #2)
+// ----------------------------------------------------------------------------
+// SPACE_MARKER (▁, U+2581) is a SentencePiece-style word-start marker. Every
+// ASCII space is turned into this marker (plus one dummy prefix at the start of
+// each encoded unit) so that word-start context is a real, in-script DEV
+// character that BPE can merge into ▁माया, instead of a standalone Ġ byte token
+// that could never merge (Ġ is a ByteFallback → MAL → Gate rejects it). decode()
+// reverses this: every ▁ becomes a space and the single dummy-prefix space is
+// dropped.
+//
+// The marker is classified as DEV, so it folds into Devanagari runs (the ~95%
+// majority). Latin-initial words keep a standalone ▁ token — acceptable, and the
+// tradeoff is documented at classify_char. To also fold Latin word-starts you
+// would add a second LAT-classified marker and choose per-first-char-script;
+// that is left out here to keep the invariant surface small.
+const SPACE_MARKER: char = '\u{2581}';
+
+// General-Punctuation characters that otherwise fall to MAL and cost 3 byte
+// tokens each (en-dash, curly quotes, ellipsis…). classify_char routes these to
+// PUN and initialize() seeds them, so each resolves to a single token. Kept to
+// the U+2010.. block only: none of these overlap the GPT-2 byte alphabet (which
+// tops out well below U+0180), so there is no aliasing to reason about. « » are
+// deliberately excluded because 0xAB/0xBB DO alias into the byte alphabet.
+const EXTENDED_PUNCT: &[char] = &[
+    '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', // ‐‑‒–—―
+    '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}',                         // ‘’‚‛
+    '\u{201C}', '\u{201D}', '\u{201E}', '\u{201F}',                         // “”„‟
+    '\u{2026}',                                                             // …
+];
+
+#[inline]
+fn is_unicode_punct(ch: char) -> bool {
+    EXTENDED_PUNCT.contains(&ch)
+}
+
+// ============================================================================
 // GPT-2 byte<->unicode alphabet (Blocker 5)
 // ----------------------------------------------------------------------------
 // Every raw byte gets a *printable, single-char* surface. Printable ASCII and
 // Latin-1 map to themselves; everything else (control bytes, 0x20 space, 0x7F,
 // 0x80..0xA0, 0xAD) maps to an obscure char at 256+n. Space (0x20) is NOT
-// special-cased -> it becomes U+0120 'Ġ', which is what enables the Ġ
-// space-prefix trick later. Decode never needs the inverse map because byte
-// tokens are recovered by *type* (Token::ByteFallback), not by surface.
+// special-cased -> it becomes U+0120 'Ġ'. With FIX #1 in place spaces are turned
+// into ▁ before tokenization, so Ġ is no longer emitted for spaces in practice;
+// the byte token still exists and still decodes to a space if an external id
+// stream contains it. Decode never needs the inverse map because byte tokens are
+// recovered by *type* (Token::ByteFallback), not by surface.
 // ============================================================================
 
 /// Reverse the training driver's TSV escaping (\\ -> \, \t -> tab, \n -> nl).
@@ -324,11 +362,34 @@ impl Vocabulary {
             let token = Arc::new(Token::SeededMorpheme(morph));
             self.add_token(token, surface, is_strict, is_ambiguous);
         }
+
+        // FIX #1: seed the space marker as a DEV-scripted, freely-mergeable base
+        // token. It must exist so greedy longest-match always has a single-char
+        // fallback for a run-initial ▁, and so BPE can learn ▁माया in the DEV
+        // pass. Not strict/ambiguous, so the Gate never blocks it as a left
+        // element.
+        self.add_token(
+            Arc::new(Token::SeededMorpheme(SPACE_MARKER.to_string())),
+            SPACE_MARKER.to_string(),
+            false,
+            false,
+        );
+
         for punct in punctuation {
             let surface = punct.clone();
             let token = Arc::new(Token::Punctuation(punct));
             self.add_token(token, surface, false, false);
         }
+
+        // FIX #2: seed extended (non-ASCII) punctuation as PUN tokens so each
+        // resolves to a single token instead of 3 byte-fallback tokens. Seeded
+        // BEFORE the byte alphabet, though none of these overlap it anyway.
+        for &ch in EXTENDED_PUNCT {
+            let surface = ch.to_string();
+            let token = Arc::new(Token::Punctuation(surface.clone()));
+            self.add_token(token, surface, false, false);
+        }
+
         // Phase 4 base alphabet: Latin letters + ASCII digits as LAT-scripted
         // tokens. Seeded BEFORE the byte alphabet so these surfaces resolve to
         // LAT (mergeable) rather than MAL byte tokens (never mergeable).
@@ -422,6 +483,12 @@ impl Vocabulary {
     /// alphabet; everything else becomes a Loaded surface token. v_strict /
     /// v_ambiguous / root sets are NOT restored, so a loaded vocab can tokenize
     /// but should not be used to resume training.
+    ///
+    /// NOTE (FIX #1): a vocab trained with the space marker will contain ▁ and
+    /// ▁-prefixed surfaces; those load fine as Loaded (DEV) tokens and encode /
+    /// decode correctly. A vocab trained BEFORE this change has no ▁ token, so
+    /// loading it here makes every space byte-fall-back to 3 tokens. Retrain and
+    /// regenerate the TSV after adopting this file.
     ///
     /// `pairs` must have contiguous ids 0..N; they are sorted defensively.
     pub fn load_from_pairs(&mut self, mut pairs: Vec<(TokenId, String)>, byte_decoder: &HashMap<char, u8>) {
@@ -807,7 +874,8 @@ impl ConstrainedBPETrainer {
         if self.latin_pass {
             // Phase 4: Latin only. Fully separate from the DEV vocabulary, so no
             // DEV/LAT token can ever form (the v2 "no token spans two scripts"
-            // guarantee still holds).
+            // guarantee still holds). The ▁ marker is DEV, so it never enters a
+            // LAT merge — Latin word-starts keep a standalone ▁.
             return sa == sb && sa == Script::LAT;
         }
         sa == sb && (sa == Script::DEV || sa == Script::PUN)
@@ -1039,12 +1107,30 @@ impl NepBPETokenizer {
     /// Tokenize text that is ALREADY normalized (N applied). The streaming
     /// trainer normalizes a whole line once, then calls this per whitespace word
     /// — avoiding one NFC/fold pass per word (billions of them at 12.8 GB).
+    ///
+    /// FIX #1: this now applies SentencePiece-style space marking BEFORE run
+    /// splitting — a single dummy ▁ prefix, plus every ASCII space rewritten to
+    /// ▁. Because the trainer calls this per whitespace word, each training word
+    /// becomes ▁word, matching exactly what encode() produces for that word when
+    /// a space precedes it. That alignment is what lets ▁माया-style merges learn
+    /// AND be applied at encode time. decode() reverses the marking.
     pub fn encode_normalized(&self, normalized: &str) -> Vec<TokenId> {
+        // Build the space-marked working string.
+        let mut marked = String::with_capacity(normalized.len() + SPACE_MARKER.len_utf8());
+        marked.push(SPACE_MARKER); // dummy word-start prefix
+        for ch in normalized.chars() {
+            if ch == ' ' {
+                marked.push(SPACE_MARKER);
+            } else {
+                marked.push(ch);
+            }
+        }
+
         let mut tokens = Vec::new();
         let mut current_run = String::new();
         let mut current_script: Option<Script> = None;
 
-        for ch in normalized.chars() {
+        for ch in marked.chars() {
             let ch_script = self.classify_char(ch);
 
             match current_script {
@@ -1074,11 +1160,26 @@ impl NepBPETokenizer {
     }
 
     fn classify_char(&self, ch: char) -> Script {
-        if ch == '\u{200C}' {
+        if ch == SPACE_MARKER {
+            // FIX #1: the word-start marker is DEV so it folds into Devanagari
+            // runs (the ~95% majority) and BPE learns ▁माया. Latin-initial words
+            // keep a standalone ▁ token; to fold those too, add a second
+            // LAT-classified marker and pick per first-char script at encode.
+            Script::DEV
+        } else if ch == '\u{200C}' {
             Script::FMT
-        } else if ch.is_ascii_punctuation() || ch == '\u{0964}' || ch == '\u{0965}' {
+        } else if ch.is_ascii_punctuation()
+            || ch == '\u{0964}'
+            || ch == '\u{0965}'
+            || is_unicode_punct(ch)
+        {
+            // FIX #2: route extended Unicode punctuation to PUN (seeded in
+            // initialize) so it resolves to one token instead of 3 byte tokens.
             Script::PUN
-        } else if ch.is_ascii_alphabetic() {
+        } else if ch.is_ascii_alphabetic() || ch.is_ascii_digit() {
+            // FIX #3: ASCII digits are seeded as LAT and their merges are
+            // learnable in the Latin pass, but without this they never reached
+            // the greedy matcher (is_ascii_alphabetic() is false for digits).
             Script::LAT
         } else if ('\u{0900}'..='\u{097F}').contains(&ch) {
             Script::DEV
@@ -1089,11 +1190,9 @@ impl NepBPETokenizer {
 
     fn tokenize_run(&self, run: &str, script: Script, tokens: &mut Vec<TokenId>) {
         match script {
-            // DEV now uses greedy longest-match over the vocab, so the learned
-            // merges are actually applied at encode time. (The old code emitted
-            // one token per codepoint via the empty DFA and never consulted the
-            // merged surfaces — that was the ~5.6-tokens/word bug.) When the DFA
-            // is populated you may instead want to segment to aksharas first and
+            // DEV/LAT use greedy longest-match over the vocab, so the learned
+            // merges are actually applied at encode time. When the DFA is
+            // populated you may instead want to segment DEV to aksharas first and
             // greedy-match at akshara granularity to keep the hard conjunct
             // guarantee; char-level greedy is what matches the trained vocab.
             Script::DEV | Script::LAT => self.tokenize_greedy(run, tokens),
@@ -1161,6 +1260,11 @@ impl NepBPETokenizer {
     /// alphabet), and preserve ZWNJ verbatim (NO surface skip). Flushes buffered
     /// bytes with from_utf8_lossy so a model-generated arbitrary byte stream
     /// degrades gracefully instead of dropping a whole run.
+    ///
+    /// FIX #1: after reconstruction, every ▁ marker becomes a space and the
+    /// single dummy-prefix space is dropped. This is the inverse of the marking
+    /// done in encode_normalized and is what makes decode(encode(s)) ==
+    /// normalize(s) hold, including for runs of multiple spaces.
     pub fn decode(&self, token_ids: &[TokenId]) -> String {
         let mut result = String::new();
         let mut byte_buf: Vec<u8> = Vec::new();
@@ -1189,7 +1293,13 @@ impl NepBPETokenizer {
         if !byte_buf.is_empty() {
             result.push_str(&String::from_utf8_lossy(&byte_buf));
         }
-        result
+
+        // Reverse the space marking.
+        let spaced = result.replace(SPACE_MARKER, " ");
+        match spaced.strip_prefix(' ') {
+            Some(rest) => rest.to_string(),
+            None => spaced,
+        }
     }
 
     pub fn verify_roundtrip(&self, s: &str) -> bool {
@@ -1493,7 +1603,8 @@ impl PyNepBPETokenizer {
     /// A reasonable start is dev=40000, lat=8000.
     ///
     /// Script separation is preserved: no DEV/LAT token can ever form, because
-    /// each pass's ScriptCompat admits only its own script.
+    /// each pass's ScriptCompat admits only its own script. The ▁ marker is DEV,
+    /// so ▁-prefixed merges are learned only in pass 1 (Devanagari word-starts).
     #[pyo3(signature = (path, dev_budget, lat_budget, theta, min_word_freq=1, progress_lines=500000, progress_merges=1000))]
     fn train_bilingual_from_file(
         &mut self,
